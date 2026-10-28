@@ -1,0 +1,6 @@
+# 本机 GNU 工具链特殊配置：
+# - 链接器钉住 rustup 自带 self-contained gcc（含 libpthread.a 等自足库），
+#   避免 PATH 中 MSYS2 gcc（缺 rust 需要的库）被误选为链接器
+# - MSYS2 binutils（as/windres/gcc）仅服务 tauri-winres 资源编译，走 PATH
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/Administrator/.rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained/x86_64-w64-mingw32-gcc.exe"
