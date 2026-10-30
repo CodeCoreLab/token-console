@@ -9,7 +9,54 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use walkdir::WalkDir;
+
+// ---------- 日志设施 ----------
+
+/// 已初始化标志（幂等，防止重复安装 subscriber）。
+static LOG_INIT: AtomicUsize = AtomicUsize::new(0);
+
+/// 初始化 tracing：GUI 进程没有控制台，日志落到
+/// `%LOCALAPPDATA%/token-console/logs/token-console.log`。
+///
+/// 只在 GUI 入口调用；`--scan` 冒烟模式仍走 stdout，不装 subscriber。
+/// 文件打开失败时静默降级为无日志——诊断设施自身不能阻塞业务。
+pub fn init_tracing() {
+    if LOG_INIT.swap(1, Ordering::SeqCst) != 0 {
+        return;
+    }
+
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+        .join("token-console")
+        .join("logs");
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let file = dir.join("token-console.log");
+    let Ok(f) = fs::OpenOptions::new().create(true).append(true).open(&file) else {
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(f))
+        .try_init();
+}
+
+/// 业务侧薄封装：未初始化 tracing 时（`--scan`/测试）不丢消息。
+pub fn log_tracing(msg: &str) {
+    if LOG_INIT.load(Ordering::SeqCst) == 0 {
+        eprintln!("[token-console] {msg}");
+        return;
+    }
+    tracing::warn!("{msg}");
+}
 
 // ---------- 路径 ----------
 
@@ -142,7 +189,14 @@ fn parse_ts(v: Option<&Value>) -> Option<f64> {
         Value::String(s) => {
             let t = s.trim();
             if let Ok(x) = t.parse::<f64>() {
-                return Some(x / 1000.0);
+                // 数字字符串与 Number 分支走同一套阈值判断：>1e12 视为毫秒，
+                // >1e9 视为秒，其余（如小得可疑的值）不采信。
+                if x > 1e12 {
+                    return Some(x / 1000.0);
+                } else if x > 1e9 {
+                    return Some(x);
+                }
+                return None;
             }
             for fmt in [
                 "%Y-%m-%dT%H:%M:%S%.fZ",
@@ -188,7 +242,17 @@ pub fn scan_usage_json(projects: Option<PathBuf>) -> Result<Value, String> {
     // sid -> (ws_idx, title, recs)
     let mut sessions: HashMap<String, (usize, Option<String>, Vec<Rec>)> = HashMap::new();
 
-    for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
+    // 不可读目录/文件计数：完全吞掉会让"数据变少"无从排查。
+    let mut walk_errors: usize = 0;
+    for entry in WalkDir::new(&root) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                walk_errors += 1;
+                log_tracing(&format!("walkdir 跳过不可读条目: {}", e));
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -276,6 +340,13 @@ pub fn scan_usage_json(projects: Option<PathBuf>) -> Result<Value, String> {
         }
     }
 
+    if walk_errors > 0 {
+        log_tracing(&format!(
+            "扫描 {} 时有 {walk_errors} 个条目不可读，已跳过",
+            root.display()
+        ));
+    }
+
     let mut sess_list: Vec<Value> = Vec::new();
     for (sid, (w, title, recs)) in &sessions {
         if recs.is_empty() {
@@ -325,6 +396,10 @@ use tauri::{
 struct AutostartMenuItem(Mutex<Option<CheckMenuItem<tauri::Wry>>>);
 
 pub fn run() {
+    // GUI 入口装日志（GUI 无控制台，错误只能落文件）；--scan 分支保持 stdout。
+    init_tracing();
+    tracing::info!("token-console 启动");
+
     // CLI 冒烟模式：token-console.exe --scan → 打印统计摘要退出（无 GUI）
     if std::env::args().any(|a| a == "--scan") {
         match scan_usage_json(None) {
@@ -438,16 +513,65 @@ mod tests {
     use super::*;
     use serde_json::Map;
 
+    /// 自建临时数据目录，替代对真实 `~/.workbuddy/projects` 的依赖。
+    /// 结构：root/<工作空间>/<会话id>.jsonl。
+    fn fixture_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("token-console-test-{}", name));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_session(root: &Path, ws: &str, sid: &str, ts: &str, model: &str) {
+        let ws_dir = root.join(ws);
+        fs::create_dir_all(&ws_dir).unwrap();
+        let line = json!({
+            "sessionId": sid,
+            "role": "user",
+            "content": "帮我看看这个测试会话的标题",
+            "timestamp": ts,
+            "providerData": {
+                "model": model,
+                "rawUsage": {
+                    "total_tokens": 100,
+                    "prompt_tokens": 80,
+                    "completion_tokens": 20,
+                    "prompt_cache_hit_tokens": 60,
+                    "prompt_tokens_details": {"cached_tokens": 0}
+                }
+            }
+        });
+        fs::write(ws_dir.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
     #[test]
-    fn scan_real_projects_dir() {
-        let v = scan_usage_json(None).expect("scan failed");
+    fn scan_fixture_dir_yields_isomorphic_structure() {
+        let root = fixture_dir("scan");
+        write_session(&root, "ws-alpha", "sess-1111", "2026-10-26T05:00:00Z", "glm-5.2-x");
+        write_session(&root, "ws-alpha", "sess-2222", "2026-10-26T06:00:00Z", "deepseek-v4");
+        write_session(&root, "ws-beta", "sess-3333", "2026-10-26T07:00:00Z", "kimi");
+
+        let v = scan_usage_json(Some(root.clone())).expect("scan failed");
         let sess = v["sess"].as_array().expect("sess array");
-        assert!(!sess.is_empty(), "no sessions found");
-        assert!(!v["models"].as_array().unwrap().is_empty());
+        assert_eq!(sess.len(), 3, "all three sessions scanned");
         // 字段结构与 Python 版同构
         let s0 = &sess[0];
         assert!(s0.get("w").is_some() && s0.get("id").is_some() && s0.get("t").is_some());
-        assert!(s0["r"].as_array().unwrap()[0].as_array().unwrap().len() == 7);
+        assert_eq!(s0["r"].as_array().unwrap()[0].as_array().unwrap().len(), 7);
+        // 工作空间短名与模型归并
+        let ws = v["ws"].as_array().unwrap();
+        assert!(ws.iter().any(|w| w == "ws-alpha"));
+        assert!(v["models"].as_array().unwrap().iter().any(|m| m == "glm-5.2"));
+        assert!(!v["models"].as_array().unwrap().iter().any(|m| m == "glm-5.2-x"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_missing_dir_is_an_error() {
+        let root = std::env::temp_dir().join("token-console-test-nonexistent");
+        let _ = fs::remove_dir_all(&root);
+        assert!(scan_usage_json(Some(root)).is_err());
     }
 
     #[test]
@@ -481,5 +605,19 @@ mod tests {
                     .timestamp() as f64
             )
         );
+    }
+
+    #[test]
+    fn parse_ts_numeric_string_applies_thresholds() {
+        // 数字字符串与 Number 分支同一套阈值：毫秒串降级为秒。
+        assert_eq!(
+            parse_ts(Some(&json!("1700000000000"))),
+            Some(1_700_000_000.0)
+        );
+        // 秒级串原样采信。
+        assert_eq!(parse_ts(Some(&json!("1700000000"))), Some(1_700_000_000.0));
+        // 小于 1e9 的值不采信（既非毫秒也非秒级时间戳）。
+        assert_eq!(parse_ts(Some(&json!("12345"))), None);
+        assert_eq!(parse_ts(Some(&json!("12345"))), None);
     }
 }
