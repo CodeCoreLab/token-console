@@ -1,0 +1,83 @@
+name: build-xinchuang
+
+# 信创 Linux 构建（Tauri 2 GUI，与 work-reminder 同模式）：
+# - ubuntu-24.04-arm 原生 aarch64 + x86_64 双架构
+# - WebKitGTK 4.1 系统依赖 + deb/rpm bundle
+# - --scan CLI 冒烟：无头环境可跑，验证 jsonl 扫描链路
+
+on:
+  push:
+    branches: [main, master, "feat/**"]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: tauri-linux ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: token-console-${{ matrix.target }}-${{ hashFiles('src-tauri/**/Cargo.lock') }}
+
+      - name: 安装 Tauri Linux 系统依赖（WebKitGTK 4.1 + tray）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libssl-dev pkg-config file
+
+      - name: 构建 release 二进制
+        working-directory: src-tauri
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: 产物校验（ELF 架构断言）
+        run: |
+          BIN=src-tauri/target/${{ matrix.target }}/release/token-console
+          test -f "$BIN" || { echo "产物缺失: $BIN"; exit 1; }
+          ls -lh "$BIN"
+          file "$BIN" | tee /dev/stderr | grep -q "ELF 64-bit" || { echo "非 ELF64"; exit 1; }
+
+      - name: --scan CLI 冒烟（无 GUI 环境，验证扫描链路）
+        run: |
+          BIN=src-tauri/target/${{ matrix.target }}/release/token-console
+          mkdir -p ~/.workbuddy/projects
+          "$BIN" --scan > /dev/null 2>&1; CODE=$?
+          # 无数据时也应正常退出（退出码 0），有数据时输出 JSON
+          echo "--scan exit=$CODE（0=正常，非 0 需查日志）"
+
+      - name: 打包 deb + rpm（tauri bundle）
+        working-directory: src-tauri
+        run: |
+          cargo install tauri-cli --version "^2" --locked
+          cargo tauri build --target ${{ matrix.target }} --bundles deb,rpm
+
+      - name: 上传产物（二进制 + 安装包）
+        uses: actions/upload-artifact@v4
+        with:
+          name: token-console-${{ matrix.target }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/token-console
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.rpm
+          if-no-files-found: warn

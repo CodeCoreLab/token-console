@@ -24,7 +24,8 @@ use walkdir::WalkDir;
 static LOG_INIT: AtomicUsize = AtomicUsize::new(0);
 
 /// 初始化 tracing：GUI 进程没有控制台，日志落到
-/// `%LOCALAPPDATA%/token-console/logs/token-console.log`。
+/// Windows `%LOCALAPPDATA%/token-console/logs`；
+/// Linux（信创）`$XDG_STATE_HOME/token-console/logs`（缺省 `~/.local/state`）。
 ///
 /// 只在 GUI 入口调用；`--scan` 冒烟模式仍走 stdout，不装 subscriber。
 /// 文件打开失败时静默降级为无日志——诊断设施自身不能阻塞业务。
@@ -33,11 +34,7 @@ pub fn init_tracing() {
         return;
     }
 
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
-        .join("token-console")
-        .join("logs");
+    let dir = log_dir();
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -67,6 +64,7 @@ pub fn log_tracing(msg: &str) {
 // ---------- 路径 ----------
 
 fn home_dir() -> PathBuf {
+    // Windows: USERPROFILE；Linux/macOS: HOME（信创麒麟/UOS 均有效）
     if let Ok(p) = std::env::var("USERPROFILE") {
         return PathBuf::from(p);
     }
@@ -74,6 +72,27 @@ fn home_dir() -> PathBuf {
         return PathBuf::from(p);
     }
     PathBuf::from(".")
+}
+
+/// 日志目录：Windows = `%LOCALAPPDATA%\token-console\logs`；
+/// Linux = `$XDG_STATE_HOME/token-console/logs`（缺省 `~/.local/state`）。
+fn log_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join("token-console")
+            .join("logs")
+    }
+    #[cfg(not(windows))]
+    {
+        let base = match std::env::var_os("XDG_STATE_HOME") {
+            Some(v) if !v.is_empty() => PathBuf::from(v),
+            _ => home_dir().join(".local").join("state"),
+        };
+        base.join("token-console").join("logs")
+    }
 }
 
 pub fn projects_dir() -> PathBuf {
